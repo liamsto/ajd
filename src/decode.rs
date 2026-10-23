@@ -185,7 +185,8 @@ mod tests {
 
     use ajd::protocol::Notification;
     use js8rs::{
-        codec::{BuildFramesOptions, EncodedFrame, build_frames},
+        codec::{BuildFramesOptions, EncodedFrame, Frame, build_frames},
+        protocol::FrameFlags,
         tx::{Channel, Modulator},
     };
 
@@ -193,13 +194,13 @@ mod tests {
 
     use super::*;
 
-    fn waveform(frame: &EncodedFrame, lead: usize) -> Vec<i16> {
+    fn waveform(frame: &EncodedFrame, lead: usize, hz: f64) -> Vec<i16> {
         let mut modulator = Modulator::new();
         let mut demod = Demod::new(48_000, RATE, 200.0..4_000.0, Mode::Usb, false, 0.25).unwrap();
         let mut pcm = [0; 4_096];
         let mut iq = [Complex::default(); 2_048];
         let mut samples = vec![0; lead];
-        modulator.start(frame, 0, 1_500.0, Duration::ZERO, Channel::Mono);
+        modulator.start(frame, 0, hz, Duration::ZERO, Channel::Mono);
         while !modulator.is_idle() {
             let len = modulator.render_stereo(&mut pcm);
             for (index, sample) in iq[..len].iter_mut().enumerate() {
@@ -232,7 +233,7 @@ mod tests {
                     .encode()
                     .unwrap();
                 assert_eq!(encoded.len(), 1);
-                let samples = waveform(&encoded[0], lead);
+                let samples = waveform(&encoded[0], lead, 1_500.0);
                 let (tx, rx) = mpsc::channel();
                 let (free, _pool) = mpsc::sync_channel(1);
                 // Last slot of a minute: trailing silence also tests minute wrap.
@@ -287,6 +288,78 @@ mod tests {
     }
 
     #[test]
+    fn wire_json() {
+        // actual js8call data!
+        for mode in MODES {
+            let mut raw = build_frames(&BuildFramesOptions::new("HELLO", mode));
+            raw.frames = [
+                ("9-S5oVx5ukfO", 1),
+                ("IUnN3JQHO+KO", 0),
+                if mode == Submode::Normal {
+                    ("tYuMzod0HA7+", 2)
+                } else {
+                    ("UBXRtAS14eV+", 6)
+                },
+                ("Vk64SVGGOq00", 3),
+                ("2URtg4DOPkfO", 3),
+                ("2URtg4DOOkfO", 3),
+            ]
+            .into_iter()
+            .map(|(txt, bits)| Frame::new(txt, FrameFlags::from_bits_truncate(bits)))
+            .collect();
+            let mut samples = Vec::new();
+            for (i, fr) in raw.encode().unwrap().iter().enumerate() {
+                samples.extend(waveform(fr, 0, 1_500.0 + i as f64 * 0.4));
+            }
+            let (tx, rx) = mpsc::channel();
+            let (free, _pool) = mpsc::sync_channel(1);
+            for (i, data) in samples.chunks(997).enumerate() {
+                tx.send(Packet {
+                    data: data.to_vec(),
+                    start: (i * 997) as u64,
+                    discontinuity: false,
+                })
+                .unwrap();
+            }
+            drop(tx);
+            let mut json = Vec::new();
+            let stats = run(
+                DecodeSettings {
+                    modes: mode.into(),
+                    min_frequency: 1_400,
+                    max_frequency: 1_600,
+                    nominal_frequency: 1_500,
+                },
+                &mut json,
+                rx,
+                free,
+            )
+            .unwrap();
+            let msgs = serde_json::Deserializer::from_slice(&json)
+                .into_iter::<Notification>()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(msgs.len(), 4, "{mode}: {stats:?} {msgs:?}");
+            assert_eq!(msgs[0].from.as_deref(), Some("F/K1ABC"), "{mode}");
+            assert_eq!(msgs[0].to.as_deref(), Some("K2XYZ"));
+            assert_eq!(msgs[0].command.as_deref(), Some("MSG"));
+            assert_eq!(msgs[0].payload.as_deref(), Some("HELLO WORLD"));
+            assert_eq!(msgs[0].checksum.as_ref().unwrap().value, "5GA");
+            assert_eq!(msgs[0].frame_count, 3);
+            for (msg, to, cmd) in [
+                (&msgs[1], "@ALLCALL", "SNR?"),
+                (&msgs[2], "@ALLCALL", "CQ"),
+                (&msgs[3], "@HB", "HEARTBEAT"),
+            ] {
+                assert_eq!(msg.from.as_deref(), Some("K1ABC"));
+                assert_eq!(msg.to.as_deref(), Some(to));
+                assert_eq!(msg.command.as_deref(), Some(cmd));
+                assert!(msg.checksum.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn gap_reset() {
         let mode = Submode::Ultra;
         let encoded = build_frames(&BuildFramesOptions::new("HELLO", mode))
@@ -297,7 +370,7 @@ mod tests {
         } else {
             0
         };
-        let samples = waveform(&encoded[0], lead);
+        let samples = waveform(&encoded[0], lead, 1_500.0);
         let split = mode.samples_for_symbols() as usize / 2 + lead;
         for timestamp_gap in [false, true] {
             let (tx, rx) = mpsc::channel();
